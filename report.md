@@ -9,111 +9,50 @@ fontsize: 11pt
 
 ## Configuration
 
-The demo was configured by creating a `.env` file in the `function-calling/` folder using the credentials from `apikey.md`:
+Credentials from `apikey.md` were placed in a `.env` file in `function-calling/`. The script loads them with `python-dotenv`:
 
 ```
-OPENAI_API_KEY=sk-...
-OPENAI_API_ENDPOINT=https://dashscope-intl.aliyuncs.com/compatible-mode/v1
 MODEL=qwen3.5-122b-a10b
+OPENAI_API_ENDPOINT=https://dashscope-intl.aliyuncs.com/compatible-mode/v1
 ```
 
-The script loads these values at start-up with `python-dotenv` and constructs the `OpenAI` client:
+Run with: `cd week-03/function-calling && uv run python three_pigs_function_calling.py`
 
-```python
-load_dotenv()
-client = OpenAI(
-    api_key=os.getenv("OPENAI_API_KEY"),
-    base_url=os.getenv("OPENAI_API_ENDPOINT"),
-)
-```
-
-The program is run with:
+## Scenario 1 — Without Function Calling (option 1)
 
 ```
-$ cd week-03/function-calling
-$ uv run python three_pigs_function_calling.py
+You (wolf): Open the door or I will blow your house down.
+
+[API Response]  finish_reason: stop
+Pig: My bricks are too strong for your tricks! I have already
+     called the hunter—he will arrive in time to stop you.
 ```
 
-The interactive menu offers two options — chat without tools (option 1) and chat with tools (option 2).
+The pig _mentions_ the hunter, but no real action is taken — `finish_reason: stop` means the model ended with prose only.
 
-## Scenario 1 — Without Function Calling
-
-With tools **disabled** the model receives only the system prompt and the user message. It must respond with text alone.
+## Scenario 2 — With Function Calling (option 2)
 
 ```
-$ python three_pigs_function_calling.py
+You (wolf): Open the door or I will blow your house down.
 
-  Choose option (1/2/q): 1
+[Round 1 — API Response]
+  finish_reason : tool_calls          ← model requests an action
+  tool_calls[0] : call_hunter(
+    urgency = "emergency",
+    message = "The Big Bad Wolf is threatening to blow my house down!"
+  )
 
-  You (wolf): Open the door or I will blow your house down.
+[Python executes call_hunter()] → "The hunter is sprinting to your location!"
 
-  [API Request sent]
-    model   : qwen3.5-122b-a10b
-    messages: [ system, user ]    ← no "tools" key
-
-  [API Response received]
-    finish_reason: stop
-    content: "My bricks are too strong for your tricks, even if I
-              am shaking with fear! I have already called the
-              hunter—he will arrive in time to stop you."
-
-  Pig: My bricks are too strong for your tricks, even if I am
-       shaking with fear! I have already called the hunter—he
-       will arrive in time to stop you.
+[Round 2 — API Response]
+  finish_reason : stop
+  content : "Thank goodness you're here! I'll stand tall while you handle him!"
 ```
 
-The pig mentions the hunter verbally, but **no real action is taken** — the model can only produce text. `finish_reason: stop` confirms the model ended the turn with prose.
-
-## Scenario 2 — With Function Calling
-
-With tools **enabled** the same prompt produces a completely different API response.
-
-```
-  Choose option (1/2/q): 2
-
-  You (wolf): Open the door or I will blow your house down.
-
-  [API Request sent — Round 1]
-    model   : qwen3.5-122b-a10b
-    messages: [ system, user ]
-    tools   : [ call_hunter ]     ← tool schema included
-
-  [API Response received — Round 1]
-    finish_reason: tool_calls     ← model did NOT write text
-    tool_calls[0]:
-      name      = 'call_hunter'
-      arguments = {
-        "urgency": "emergency",
-        "message": "The Big Bad Wolf is at my brick house
-                    demanding I open the door and threatening
-                    to blow it down! Please come quickly!"
-      }
-
-  [Python executes call_hunter(urgency="emergency", ...)]
-    -> "The hunter is sprinting to your location with backup!"
-
-  [API Request sent — Round 2]
-    messages: [ system, user, assistant(tool_calls), tool(result) ]
-
-  [API Response received — Round 2]
-    finish_reason: stop
-    content: "*Peeking through the window as the hunter charges
-               forward*
-               Thank goodness you're here! Wolf can't touch this
-               brick now... *takes a shaky breath*
-               I'll stand tall while you handle him!"
-
-  Pig: *Peeking through the window as the hunter charges forward*
-       Thank goodness you're here! Wolf can't touch this brick
-       now... I'll stand tall while you handle him!
-```
-
-Key observations:
-
-- `finish_reason: tool_calls` — the model signalled it wants to call a function instead of generating a reply
-- The Python host (not the model) executed `call_hunter()` and got a concrete result
-- A **second API call** was required to let the model incorporate the tool result into its final answer
-- The pig now genuinely acts rather than only speaking
+- `finish_reason: tool_calls` — the model requested an action instead of writing text
+- The **Python host** (not the model) executed `call_hunter()` and fed the result back
+- A **second API call** was needed to get the final answer
+- The pig now genuinely acts
 
 ## What Changed When Tools Were Enabled
 
@@ -138,39 +77,13 @@ The host program, **not** the model, executes the real Python function, then sen
 
 ## Normal Answer vs Tool Call
 
-The difference is visible directly in the API response structure:
+**Normal** (`finish_reason: stop`) — model writes text and the loop ends:  
+`message.content = "My bricks are too strong…"`, `tool_calls = null`
 
-**Normal response** — model answers with text, conversation ends:
-```json
-{
-  "finish_reason": "stop",
-  "message": {
-    "role": "assistant",
-    "content": "My bricks are too strong for your tricks..."
-  }
-}
-```
+**Tool call** (`finish_reason: tool_calls`) — model requests an action:  
+`message.content = null`, `message.tool_calls[0].function = {name: "call_hunter", arguments: "{…}"}`
 
-**Tool call response** — model requests an action, conversation must continue:
-```json
-{
-  "finish_reason": "tool_calls",
-  "message": {
-    "role": "assistant",
-    "content": null,
-    "tool_calls": [{
-      "id": "call_0_call_hunter_0",
-      "type": "function",
-      "function": {
-        "name": "call_hunter",
-        "arguments": "{\"urgency\": \"emergency\", \"message\": \"...\"}"
-      }
-    }]
-  }
-}
-```
-
-In the second case the `content` field is `null` — the model produced no text. It is waiting for the tool result before it can continue.
+The `content` is `null` when a tool call fires — the model produced no text and is waiting for the result.
 
 ## Why the Host Remains in Control
 
@@ -208,19 +121,9 @@ Adding tools for every conceivable operation (integration, limits, matrices …)
 
 ## Key Code Fragments
 
-### Tool implementations (SymPy)
+### Tool implementation — `solve_equation`
 
 ```python
-def evaluate_expression(expression: str) -> str:
-    expr = sp.sympify(expression, evaluate=True)
-    simplified = sp.simplify(expr)
-    if simplified.is_number:
-        if simplified.is_integer:
-            return str(simplified)
-        num_val = float(sp.N(simplified))
-        return f"{simplified}  ≈  {num_val:.6g}"
-    return str(simplified)
-
 def solve_equation(equation: str, variable: str = "x") -> str:
     var = sp.Symbol(variable)
     lhs_str, rhs_str = equation.split("=", 1)
@@ -229,71 +132,24 @@ def solve_equation(equation: str, variable: str = "x") -> str:
     return f"{variable} = " + ",  ".join(str(s) for s in solutions)
 ```
 
-### Tool schema (JSON)
-
-```json
-{
-  "type": "function",
-  "function": {
-    "name": "solve_equation",
-    "description": "Solve an algebraic equation for a given variable and return all solutions.",
-    "parameters": {
-      "type": "object",
-      "properties": {
-        "equation": { "type": "string",
-                      "description": "e.g. 'x**2 - 5*x + 6 = 0'" },
-        "variable": { "type": "string",
-                      "description": "Variable to solve for (default: 'x')" }
-      },
-      "required": ["equation"]
-    }
-  }
-}
-```
-
 ### Agentic loop
 
 ```python
 while True:
     response = client.chat.completions.create(
-        model=model, messages=messages,
-        tools=TOOLS, tool_choice="auto"
+        model=model, messages=messages, tools=TOOLS, tool_choice="auto"
     )
     msg = response.choices[0].message
     messages.append({"role": "assistant", "content": msg.content or "",
                      "tool_calls": [...]})
-
-    if not msg.tool_calls:          # final answer — print and exit loop
-        display(msg.content)
-        break
-
-    for tc in msg.tool_calls:       # execute each requested tool
+    if not msg.tool_calls:   # final answer
+        display(msg.content); break
+    for tc in msg.tool_calls:
         result = TOOL_FUNCTIONS[tc.function.name](**json.loads(tc.function.arguments))
         messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
 ```
 
-The loop continues until the model produces a reply with no `tool_calls`. This allows multi-step problems where several tools are needed in sequence.
-
-### Plot function
-
-```python
-def plot_function(expression, x_min=-10.0, x_max=10.0):
-    x = sp.Symbol("x")
-    f = sp.lambdify(x, sp.sympify(expression), modules=["numpy"])
-    xs = np.linspace(float(x_min), float(x_max), 800)
-    ys = np.asarray(f(xs), dtype=float)
-    fig, ax = plt.subplots(figsize=(8, 5))
-    ax.plot(xs, ys, linewidth=2, color="#1f77b4")
-    ax.set_title(f"f(x) = {expression}")
-    ax.grid(True, linestyle="--", alpha=0.4)
-    safe = "".join(c if c.isalnum() or c in "._+-" else "_" for c in expression)
-    path = PLOTS_DIR / f"{safe}.png"
-    fig.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    return str(path)
-```
-
-`sp.lambdify` converts the symbolic SymPy expression into a callable NumPy function so that vectorised evaluation across 800 x-points is fast and accurate.
+The loop continues until the model returns no `tool_calls`, allowing multi-step problems. `sp.lambdify` is used in `plot_function` to convert a SymPy expression into a vectorised NumPy callable for fast plotting over 800 points.
 
 ---
 
@@ -347,7 +203,7 @@ SymPy returns the exact rational `17/2` and the decimal approximation.
 ← .../plots/x__2_-_4_x_+_3.png
 ```
 
-![Plot of x² - 4x + 3](math-solver/plots/x__2_-_4_x_+_3.png)
+![Plot of x² - 4x + 3](plots/x__2_-_4_x_+_3.png)
 
 ### Vertex and plot — `What is the vertex of y = x^2 - 6x + 5? Plot it too`
 
@@ -364,7 +220,7 @@ The model called three tools in a single turn:
 
 Final answer: vertex at **(3, −4)**.
 
-![Plot of x² - 6x + 5](math-solver/plots/x__2_-_6_x_+_5.png)
+![Plot of x² - 6x + 5](plots/x__2_-_6_x_+_5.png)
 
 ## Robustness / Failure Cases
 
@@ -411,42 +267,26 @@ This separation is what makes function-calling agents more reliable than pure-te
 
 # Part 6 — Questions
 
-**1. Why is function calling more reliable than asking the model to "just do the math" in plain text?**
+**1. Why is function calling more reliable than asking the model to "just do the math"?**  
+LLMs are probabilistic text predictors and can produce plausible-but-wrong arithmetic. `sp.solve()` is deterministic — it cannot hallucinate.
 
-LLMs are probabilistic text predictors. They can produce plausible-looking but wrong arithmetic. A call to `sp.solve()` or `sp.simplify()` is deterministic — given the same input it always gives the same correct result. Function calling routes numerical work to code that cannot hallucinate.
+**2. Why should the tool set be small and well-defined?**  
+Each tool expands the decision space. Vague or overlapping tools increase the chance of wrong tool selection or malformed arguments. A small set with precise, non-overlapping descriptions consistently produces correct choices.
 
-**2. Why should the available tool set be small and well-defined?**
+**3. What is the role of SymPy?**  
+SymPy provides symbolic algebra: exact rational arithmetic, polynomial factoring, and equation solving — free from floating-point rounding errors.
 
-Each tool adds to the decision space the model must reason over. Vague or overlapping tools increase the probability of the wrong tool being chosen or arguments being malformed. A small set with precise descriptions and non-overlapping responsibilities consistently produces correct choices.
+**4. What is the role of Matplotlib?**  
+Matplotlib renders the NumPy array from `sp.lambdify` into a PNG — a tangible artefact a text-only answer cannot produce.
 
-**3. What is the role of SymPy in the solution?**
+**5. What happens from user input to final answer?**  
+1. Input added to `messages` as `user` turn → 2. API called with `messages + TOOLS` → 3. Each `tool_calls` entry dispatched to Python → 4. Results appended as `tool` messages, loop repeats → 5. Model replies with text only (`finish_reason: stop`), answer displayed.
 
-SymPy provides symbolic algebra: exact rational arithmetic, algebraic simplification, polynomial factoring, and symbolic equation solving. It replaces floating-point approximations with mathematically exact results that can be displayed as fractions or radicals.
+**6. What errors can still occur?**  
+Model may pass invalid SymPy syntax (`^` instead of `**`), choose the wrong tool, or hallucinate a tool name. `try/except` in each tool returns an error string rather than crashing.
 
-**4. What is the role of Matplotlib in the solution?**
-
-Matplotlib renders the NumPy array of `(x, f(x))` pairs produced by `sp.lambdify` into a publication-quality PNG. The file is a tangible, persistent artefact the student can open and inspect, which a text-only answer could never provide.
-
-**5. What happens from the moment the user types a problem to the final answer?**
-
-1. The input is added to `messages` as a `user` turn.
-2. `client.chat.completions.create()` sends `messages` + `TOOLS` to the model.
-3. If the response contains `tool_calls`, each call is dispatched to the matching Python function.
-4. Each result is appended as a `tool` message and the API is called again.
-5. When the model responds with text only (no `tool_calls`), the answer is displayed and the loop exits.
-
-**6. What kinds of errors can still happen even when function calling is used?**
-
-- The model may pass syntactically invalid SymPy expressions (e.g. using `^` instead of `**`).
-- It may call the wrong tool (e.g. `evaluate_expression` instead of `solve_equation`).
-- Tool functions can raise `ValueError` or `TypeError` if the expression is mathematically undefined.
-- The model may hallucinate a tool name that does not exist in `TOOL_FUNCTIONS`.
-
-All of these are handled either by the `try/except` blocks in each tool function (which return an error string rather than crashing) or by the model's own reasoning before it calls the tool.
-
-**7. When should the model answer directly, and when should it call a tool?**
-
-The model should answer directly when the question is conceptual, definitional, or requires only language (e.g. "What is a quadratic equation?"). It should call a tool whenever the answer requires computation, exact algebra, or a visual output that would be error-prone to produce from memory.
+**7. When should the model answer directly vs call a tool?**  
+Directly for conceptual/definitional questions ("What is a quadratic?"). Tool call whenever exact computation or a visual result is needed.
 
 ---
 
