@@ -35,9 +35,15 @@ import numpy as np
 import sympy as sp
 from dotenv import load_dotenv
 from openai import OpenAI
+from rich import box
 from rich.console import Console
+from rich.live import Live
 from rich.markdown import Markdown
 from rich.panel import Panel
+from rich.spinner import Spinner
+from rich.syntax import Syntax
+from rich.table import Table
+from rich.text import Text
 
 # ── Bootstrap ──────────────────────────────────────────────────────────────────
 load_dotenv(Path(__file__).parent / ".env")
@@ -262,6 +268,92 @@ TOOLS = [
 ]
 
 
+# ── UI helpers (matching three_pigs_function_calling.py style) ──────────────────
+
+def create_message_panel(role: str, content: str) -> Panel:
+    """Create a styled panel for a chat message."""
+    styles = {
+        "user":      ("bright_white on blue",      "blue",    "🧠 You"),
+        "assistant": ("bright_white on dark_green", "green",   "🤖 Assistant"),
+        "system":    ("bright_white on purple4",    "magenta", "⚙️ System"),
+        "tool":      ("black on yellow",            "yellow",  "🔧 Tool Result"),
+    }
+    text_style, border_color, title = styles.get(role, ("bright_white on grey23", "white", role))
+    return Panel(
+        Text(content, style=text_style),
+        title=title,
+        title_align="left",
+        border_style=border_color,
+        padding=(0, 1),
+    )
+
+
+def show_context_stack(messages: list) -> Panel:
+    """Show the current conversation context as a table."""
+    table = Table(
+        box=box.SIMPLE,
+        show_header=True,
+        header_style="bold bright_white on grey23",
+        style="on grey23",
+    )
+    table.add_column("#",    style="bright_cyan on grey23",    width=3)
+    table.add_column("Role", style="bright_magenta on grey23", width=12)
+    table.add_column("Content Preview", style="bright_white on grey23")
+    for i, msg in enumerate(messages):
+        role = msg.get("role", "unknown")
+        content = msg.get("content") or ""
+        preview = content.replace("\n", " ") if content else "(tool_calls)"
+        table.add_row(str(i), role, preview[:120])
+    tool_names = ", ".join(TOOL_FUNCTIONS.keys())
+    return Panel(
+        table,
+        title=f"📚 Context Stack ({len(messages)} messages) | Tools: [{tool_names}]",
+        border_style="magenta",
+        style="on grey23",
+        padding=(0, 1),
+    )
+
+
+def show_api_request(request_data: dict) -> Panel:
+    """Show the outgoing API request as syntax-highlighted JSON."""
+    json_str = json.dumps(request_data, indent=2, ensure_ascii=False)
+    syntax = Syntax(json_str, "json", theme="monokai", background_color="grey23", word_wrap=True)
+    return Panel(
+        syntax,
+        title="📤 API Request (sent to model)",
+        border_style="yellow",
+        style="on grey23",
+        padding=(0, 1),
+    )
+
+
+def show_api_response(response_data: dict) -> Panel:
+    """Show the incoming API response as syntax-highlighted JSON."""
+    json_str = json.dumps(response_data, indent=2, ensure_ascii=False)
+    syntax = Syntax(json_str, "json", theme="monokai", background_color="grey23", word_wrap=True)
+    return Panel(
+        syntax,
+        title="📥 API Response (from model)",
+        border_style="cyan",
+        style="on grey23",
+        padding=(0, 1),
+    )
+
+
+def wait_for_llm():
+    """Live spinner displayed while waiting for the model."""
+    return Live(
+        Panel(
+            Spinner("dots", text=Text(" Waiting for model response...", style="bold black on yellow")),
+            border_style="yellow",
+            style="on yellow",
+            padding=(0, 1),
+        ),
+        console=console,
+        refresh_per_second=10,
+    )
+
+
 # ── Agent loop ─────────────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = (
@@ -275,117 +367,209 @@ SYSTEM_PROMPT = (
 )
 
 
-def _dispatch_tool(tool_call) -> str:
-    """Execute a single tool call and return its string result."""
+def _dispatch_tool(tool_call, messages: list) -> str:
+    """Execute a single tool call, display Rich panels, append result to messages."""
     name = tool_call.function.name
     try:
         args = json.loads(tool_call.function.arguments)
     except json.JSONDecodeError as exc:
-        return f"Error parsing arguments: {exc}"
+        err = f"Error parsing arguments: {exc}"
+        console.print(create_message_panel("tool", err))
+        messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": err})
+        return err
 
     fn = TOOL_FUNCTIONS.get(name)
     if fn is None:
-        return f"Unknown tool: {name}"
+        err = f"Unknown tool: {name}"
+        console.print(create_message_panel("tool", err))
+        messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": err})
+        return err
 
-    label = ", ".join(f"{k}={v!r}" for k, v in args.items())
-    console.print(f"  [dim cyan]→ {name}({label})[/dim cyan]")
+    # Show the function call (yellow panel like three_pigs)
+    args_display = ",\n   ".join(f'{k}={v!r}' for k, v in args.items())
+    console.print()
+    console.print(
+        Panel(
+            Text(f"🔧 FUNCTION CALLED: {name}(\n   {args_display}\n)", style="bold black on yellow"),
+            border_style="yellow",
+            style="on yellow",
+            padding=(0, 1),
+        )
+    )
+
     result = fn(**args)
-    console.print(f"  [dim green]← {result}[/dim green]")
+
+    # Show the tool result
+    console.print()
+    console.print(create_message_panel("tool", str(result)))
+
+    messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": str(result)})
     return str(result)
 
 
 def run_agent(client: OpenAI, model: str, user_problem: str) -> None:
     """Run the agentic loop for a single user problem."""
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": user_problem},
+        {"role": "system",  "content": SYSTEM_PROMPT},
+        {"role": "user",    "content": user_problem},
     ]
 
+    # Show user message and initial context
     console.print()
+    console.print(create_message_panel("user", user_problem))
+    console.print()
+    console.print(show_context_stack(messages))
 
     while True:
-        response = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            tools=TOOLS,
-            tool_choice="auto",
-        )
+        # Build request payload for display
+        request_data = {
+            "model":    model,
+            "messages": messages,
+            "tools":    TOOLS,
+            "tool_choice": "auto",
+        }
+        console.print()
+        console.print(show_api_request(request_data))
+
+        # Call the API with a spinner
+        with wait_for_llm():
+            response = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                tools=TOOLS,
+                tool_choice="auto",
+            )
 
         msg = response.choices[0].message
 
-        # Build the assistant message dict manually so it round-trips cleanly
+        # Show the raw response
+        response_data: dict = {
+            "id":            response.id,
+            "model":         response.model,
+            "finish_reason": response.choices[0].finish_reason,
+            "message": {
+                "role":       "assistant",
+                "content":    msg.content,
+                "tool_calls": None,
+            },
+        }
+        if msg.tool_calls:
+            response_data["message"]["tool_calls"] = [
+                {"id": tc.id, "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
+                for tc in msg.tool_calls
+            ]
+        console.print()
+        console.print(show_api_response(response_data))
+
+        # Build the assistant entry
         assistant_entry: dict = {"role": "assistant", "content": msg.content or ""}
         if msg.tool_calls:
             assistant_entry["tool_calls"] = [
                 {
-                    "id": tc.id,
+                    "id":   tc.id,
                     "type": "function",
-                    "function": {
-                        "name": tc.function.name,
-                        "arguments": tc.function.arguments,
-                    },
+                    "function": {"name": tc.function.name, "arguments": tc.function.arguments},
                 }
                 for tc in msg.tool_calls
             ]
         messages.append(assistant_entry)
 
+        # If the assistant wrote text alongside tool_calls, show it
+        if msg.content and msg.tool_calls:
+            console.print()
+            console.print(create_message_panel("assistant", msg.content))
+
         # No tool calls → final answer
         if not msg.tool_calls:
             content = msg.content or ""
+            console.print()
             console.print(
                 Panel(
                     Markdown(content),
-                    title="[bold green]Answer[/bold green]",
+                    title="[bold green]✅ Answer[/bold green]",
                     border_style="green",
                     padding=(1, 2),
                 )
             )
+            console.print()
+            console.print(show_context_stack(messages))
             break
 
-        # Execute every requested tool and feed results back
+        # Execute every requested tool
         for tc in msg.tool_calls:
-            result = _dispatch_tool(tc)
-            messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": tc.id,
-                    "content": result,
-                }
-            )
+            _dispatch_tool(tc, messages)
+
+        # Show updated context before next API round
+        console.print()
+        console.print(show_context_stack(messages))
 
 
 # ── CLI entry point ────────────────────────────────────────────────────────────
 
 def main() -> None:
-    api_key = os.getenv("OPENAI_API_KEY")
+    api_key  = os.getenv("OPENAI_API_KEY")
     base_url = os.getenv("OPENAI_API_ENDPOINT") or None
-    model = os.getenv("MODEL", "gpt-4o")
+    model    = os.getenv("MODEL", "gpt-4o")
 
     if not api_key:
         console.print(
-            "[bold red]Error:[/bold red] OPENAI_API_KEY is not set. "
-            "Add it to a .env file in the same directory as this script."
+            Panel(
+                Text(
+                    "OPENAI_API_KEY not found!\n\n"
+                    "Create a .env file in the same directory with:\n"
+                    "OPENAI_API_KEY=your-key-here",
+                    style="bold bright_white on dark_red",
+                ),
+                title="❌ Error",
+                border_style="red",
+                style="on dark_red",
+            )
         )
         sys.exit(1)
 
     client = OpenAI(api_key=api_key, base_url=base_url)
 
+    console.clear()
+
+    # Welcome panel
     console.print(
         Panel(
-            "[bold cyan]Math Solver[/bold cyan]  —  AI tutor powered by function calling\n"
-            "[dim]Tools: evaluate · solve · factor · plot[/dim]",
-            border_style="cyan",
+            Text.from_markup(
+                "[bold bright_white]🧠 Math Solver — AI Tutor[/bold bright_white]\n\n"
+                "[bright_cyan]Powered by function calling[/bright_cyan]\n\n"
+                "[bright_white]Type a high-school math problem in natural language.\n"
+                "The model will use tools to solve it step by step.[/bright_white]"
+            ),
+            title="📚 Math Solver 📚",
+            title_align="center",
+            border_style="bright_magenta",
+            style="on grey23",
             padding=(1, 4),
         )
     )
+
+    # Config panel
+    console.print()
     console.print(
-        "[dim]Type your math problem and press Enter.  "
-        "Type [bold]quit[/bold] or [bold]exit[/bold] to stop.[/dim]\n"
+        Panel(
+            Text(
+                f"Model:    {model}\n"
+                f"Endpoint: {base_url or 'https://api.openai.com/v1'}\n"
+                f"Tools:    evaluate_expression · solve_equation · factor_expression · plot_function",
+                style="bright_white on grey23",
+            ),
+            title="⚙️ Configuration",
+            border_style="cyan",
+            style="on grey23",
+        )
     )
+
+    console.print()
+    console.print("[dim]Type your math problem and press Enter.  Type [bold]quit[/bold] or [bold]exit[/bold] to stop.[/dim]\n")
 
     while True:
         try:
-            problem = console.input("[bold yellow]Problem:[/bold yellow] ").strip()
+            problem = console.input("[bold yellow]🧠 Problem:[/bold yellow] ").strip()
         except (KeyboardInterrupt, EOFError):
             console.print("\n[dim]Bye![/dim]")
             break
